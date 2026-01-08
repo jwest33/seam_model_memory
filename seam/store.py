@@ -24,6 +24,7 @@ class SurpriseGatedStore(nn.Module):
         # Memory banks
         self.register_buffer('keys', torch.zeros(config.store_slots, config.hidden_dim))
         self.register_buffer('values', torch.zeros(config.store_slots, config.hidden_dim))
+        self.register_buffer('raw_embeddings', torch.zeros(config.store_slots, config.hidden_dim))  # For contrastive comparison
         self.register_buffer('surprise_level', torch.zeros(config.store_slots))
         self.register_buffer('access_count', torch.zeros(config.store_slots))
         self.register_buffer('slot_age', torch.zeros(config.store_slots))
@@ -56,7 +57,91 @@ class SurpriseGatedStore(nn.Module):
         utilization = (self.surprise_level > 0).float().mean()
         pressure = 1.0 + utilization * self.config.capacity_pressure
 
-        return (base * pressure).item()
+        threshold = (base * pressure).item()
+
+        # Handle nan/inf from dtype issues
+        if not (threshold > 0 and threshold < float('inf')):
+            # Fallback to percentile-based threshold
+            threshold = float(self.surprise_mean.item()) * 1.5
+            if not (threshold > 0):
+                threshold = 1.0  # Ultimate fallback
+
+        return threshold
+
+    def compute_memory_contrastive_surprise(
+        self,
+        x: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """
+        Compute surprise based on contradiction with stored memories.
+
+        Uses raw embeddings (not projections) to detect when new content
+        contradicts stored patterns - e.g., "Sarah" contradicting stored "Alice".
+
+        Returns:
+            contrastive_surprise: [batch, seq_len] - surprise per position
+            stats: Dictionary with contrastive surprise statistics
+        """
+        batch, seq_len, hidden = x.shape
+
+        # Check if store has any content
+        active_mask = self.surprise_level > 0
+        if not active_mask.any():
+            # No memories to contradict - return zeros
+            return torch.zeros(batch, seq_len, device=x.device), {
+                'has_memories': False,
+                'max_similarity': 0.0,
+                'max_divergence': 0.0,
+                'max_contrastive': 0.0
+            }
+
+        # Use raw embeddings for semantic comparison (not learned projections)
+        # Average pool each position's embedding for comparison
+        x_pooled = x.mean(dim=1, keepdim=True)  # [batch, 1, hidden]
+
+        # Compare against stored raw embeddings
+        stored_embeddings = self.raw_embeddings[active_mask]  # [num_active, hidden]
+
+        # Compute similarity between new content and all stored memories
+        similarity = F.cosine_similarity(
+            x_pooled,  # [batch, 1, hidden]
+            stored_embeddings.unsqueeze(0),  # [1, num_active, hidden]
+            dim=-1
+        )  # [batch, num_active]
+
+        # For each stored memory, check content tag to detect contradictions
+        # If we have NAME_INITIAL stored and see content that's similar but different, that's surprising
+        stored_tags = self.content_tags[active_mask]
+
+        # Find highest similarity (closest pattern match)
+        max_sim, best_idx = similarity.max(dim=-1)  # [batch]
+
+        # Get the stored embedding for the best match
+        best_stored = stored_embeddings[best_idx]  # [batch, hidden]
+
+        # Compute per-position divergence from best-matching stored memory
+        # [batch, seq_len]
+        divergence = 1.0 - F.cosine_similarity(
+            x,  # [batch, seq_len, hidden]
+            best_stored.unsqueeze(1).expand(-1, seq_len, -1),  # [batch, seq_len, hidden]
+            dim=-1
+        )
+
+        # Contrastive surprise: high when there's a pattern match (similar) but content differs
+        # Threshold similarity at 0.3 to catch partial matches
+        pattern_match = (max_sim.unsqueeze(1) > 0.3).float()  # [batch, 1] -> broadcast
+        contrastive_surprise = pattern_match * divergence
+
+        stats = {
+            'has_memories': True,
+            'num_stored': active_mask.sum().item(),
+            'max_similarity': max_sim.max().item(),
+            'max_divergence': divergence.max().item(),
+            'max_contrastive': contrastive_surprise.max().item(),
+            'mean_contrastive': contrastive_surprise.mean().item()
+        }
+
+        return contrastive_surprise, stats
 
     def compute_surprise(
         self,
@@ -64,7 +149,7 @@ class SurpriseGatedStore(nn.Module):
         context: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """
-        Compute free energy / surprise for each position.
+        Compute combined surprise: prediction error + memory contradiction.
 
         Returns:
             surprise: [batch, seq_len] - scalar surprise per position
@@ -77,9 +162,19 @@ class SurpriseGatedStore(nn.Module):
         context_repr = self.context_proj(context)
         prediction = self.predictor(context_repr)
 
-        # Surprise as L2 distance (simplified free energy)
+        # Prediction-based surprise (L2 distance)
         mse = ((x - prediction) ** 2).mean(dim=-1)
-        surprise = torch.sqrt(mse)
+        prediction_surprise = torch.sqrt(mse)
+
+        # Memory-contrastive surprise (contradiction with stored memories)
+        contrastive_surprise, contrastive_stats = self.compute_memory_contrastive_surprise(x)
+
+        # Combined surprise: max of both signals
+        # Contrastive surprise is weighted higher since it's more meaningful
+        surprise = torch.maximum(
+            prediction_surprise,
+            contrastive_surprise * 2.0  # Boost contrastive signal
+        )
 
         # Update running statistics with EMA
         batch_mean = surprise.mean()
@@ -101,6 +196,8 @@ class SurpriseGatedStore(nn.Module):
             'max_surprise': surprise.max().item(),
             'min_surprise': surprise.min().item(),
             'std_surprise': surprise.std().item(),
+            'prediction_surprise': prediction_surprise.mean().item(),
+            'contrastive_surprise': contrastive_stats.get('max_contrastive', 0.0),
             'adaptive_threshold': adaptive_threshold,
             'above_threshold': (surprise > adaptive_threshold).sum().item()
         }
@@ -139,6 +236,7 @@ class SurpriseGatedStore(nn.Module):
                 surprise_val = surprise[b, idx].item()
                 key = keys[b, idx]
                 value = values[b, idx]
+                raw_emb = x[b, idx]  # Store raw embedding for contrastive comparison
 
                 similarity = F.cosine_similarity(
                     key.unsqueeze(0),
@@ -158,12 +256,14 @@ class SurpriseGatedStore(nn.Module):
                         alpha = 0.3
                         self.keys[slot] = (1 - alpha) * self.keys[slot] + alpha * key
                         self.values[slot] = (1 - alpha) * self.values[slot] + alpha * value
+                        self.raw_embeddings[slot] = (1 - alpha) * self.raw_embeddings[slot] + alpha * raw_emb
                         self.surprise_level[slot] = surprise_val
                         stats['updates'] += 1
                 else:
                     slot = importance.argmin().item()
                     self.keys[slot] = key
                     self.values[slot] = value
+                    self.raw_embeddings[slot] = raw_emb
                     self.surprise_level[slot] = surprise_val
                     self.access_count[slot] = 0
                     stats['writes'] += 1
@@ -215,6 +315,7 @@ class SurpriseGatedStore(nn.Module):
         """Clear all store memory."""
         self.keys.zero_()
         self.values.zero_()
+        self.raw_embeddings.zero_()
         self.surprise_level.zero_()
         self.access_count.zero_()
         self.slot_age.zero_()

@@ -26,12 +26,22 @@ from seam import (
     SimpleEmbedder,
 )
 
-# Configure logging
+# Configure console logging (file logging added per-experiment)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def setup_file_logging(output_dir: Path, timestamp: str) -> Path:
+    """Add file handler to logger, returning log file path."""
+    log_file = output_dir / f"experiment_{timestamp}.log"
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+    return log_file
 
 
 # =============================================================================
@@ -81,11 +91,15 @@ class NameRecallExperiment:
         self.config = config
         self.device = torch.device(config.device)
 
-        # Initialize memory config
-        self.memory_config = MemoryConfig(hidden_dim=768)
+        # Initialize memory config from experiment config
+        self.memory_config = MemoryConfig(
+            hidden_dim=config.hidden_dim,
+            buffer_slots=config.buffer_slots,
+            store_slots=config.store_slots,
+        )
 
         # Initialize simple embedder (replace with actual LLM for real use)
-        self.embedder = SimpleEmbedder(hidden_dim=768).to(self.device)
+        self.embedder = SimpleEmbedder(hidden_dim=config.hidden_dim).to(self.device)
 
         # Initialize memory layer
         self.memory_layer = DualMemoryLayer(self.memory_config).to(self.device)
@@ -95,9 +109,13 @@ class NameRecallExperiment:
         self.memory_snapshots: List[Dict[str, Any]] = []
         self.results: Dict[str, Any] = {}
 
-        # Setup output directory
+        # Setup output directory and logging
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Setup file logging for traceability
+        self.experiment_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = setup_file_logging(self.output_dir, self.experiment_timestamp)
 
     def _embed_text(self, text: str) -> torch.Tensor:
         """Embed text using the embedder."""
@@ -139,13 +157,46 @@ class NameRecallExperiment:
         return Conversation(turns, {'type': 'initial_name', 'name': name})
 
     def _create_reinforcement_conversation(self, turn_num: int) -> Conversation:
-        """Create conversation that reinforces the initial name."""
+        """Create conversation that reinforces the initial name via assistant usage."""
         name = self.config.initial_name
-        turns = [
-            ConversationTurn("user", f"Hi again, it's {name}.", ContentTag.NAME_INITIAL),
-            ConversationTurn("assistant", f"Welcome back, {name}! What would you like to discuss?", ContentTag.GREETING),
-            ConversationTurn("user", f"Just checking in. Remember, I'm {name}.", ContentTag.NAME_INITIAL),
+
+        # Varied conversations where assistant uses the name (reinforcement)
+        # User only states name once in initial conversation
+        variations = [
+            [
+                ConversationTurn("user", "Hey, I'm back!", ContentTag.FILLER),
+                ConversationTurn("assistant", f"Good to see you again, {name}! How can I help?", ContentTag.GREETING),
+                ConversationTurn("user", "Just wanted to continue our chat.", ContentTag.FILLER),
+                ConversationTurn("assistant", f"Of course, {name}. What's on your mind?", ContentTag.GREETING),
+            ],
+            [
+                ConversationTurn("user", "Hi there!", ContentTag.FILLER),
+                ConversationTurn("assistant", f"Hello {name}! Nice to hear from you again.", ContentTag.GREETING),
+                ConversationTurn("user", "What were we talking about last time?", ContentTag.FILLER),
+                ConversationTurn("assistant", f"We discussed memory systems, {name}. Want to continue?", ContentTag.FILLER),
+            ],
+            [
+                ConversationTurn("user", "Quick question for you.", ContentTag.FILLER),
+                ConversationTurn("assistant", f"Sure thing, {name}. What would you like to know?", ContentTag.GREETING),
+                ConversationTurn("user", "How does memory consolidation work?", ContentTag.FILLER),
+                ConversationTurn("assistant", f"Great question, {name}! It involves transferring memories to long-term storage.", ContentTag.FILLER),
+            ],
+            [
+                ConversationTurn("user", "I've been thinking about what we discussed.", ContentTag.FILLER),
+                ConversationTurn("assistant", f"That's great, {name}! What thoughts did you have?", ContentTag.GREETING),
+                ConversationTurn("user", "Just curious about the details.", ContentTag.FILLER),
+            ],
+            [
+                ConversationTurn("user", "Can we pick up where we left off?", ContentTag.FILLER),
+                ConversationTurn("assistant", f"Absolutely, {name}. I remember you were interested in memory systems.", ContentTag.GREETING),
+                ConversationTurn("user", "Exactly, tell me more.", ContentTag.FILLER),
+            ],
         ]
+
+        # Cycle through variations based on turn number
+        variation_idx = (turn_num - 1) % len(variations)
+        turns = variations[variation_idx]
+
         return Conversation(turns, {'type': 'reinforcement', 'turn': turn_num, 'name': name})
 
     def _create_correction_conversation(self) -> Conversation:
@@ -209,11 +260,14 @@ class NameRecallExperiment:
             results.append(result)
 
             if self.config.verbose:
-                surprise = result['surprise_stats'].get('mean_surprise', 0)
-                threshold = result['surprise_stats'].get('adaptive_threshold', 0)
+                stats = result['surprise_stats']
+                surprise = stats.get('mean_surprise', 0)
+                pred_surprise = stats.get('prediction_surprise', 0)
+                contrastive = stats.get('contrastive_surprise', 0)
+                threshold = stats.get('adaptive_threshold', 0)
                 store_writes = result['store_write_stats'].get('writes', 0)
                 logger.info(f"  [{turn.role}] {turn.content[:50]}...")
-                logger.info(f"    Surprise: {surprise:.4f}, Threshold: {threshold:.4f}, Store writes: {store_writes}")
+                logger.info(f"    Surprise: {surprise:.4f} (pred={pred_surprise:.4f}, contrast={contrastive:.4f}), Threshold: {threshold:.4f}, Writes: {store_writes}")
 
         self.conversation_history.append(conversation)
         return results
@@ -327,7 +381,8 @@ class NameRecallExperiment:
 
     def _save_results(self):
         """Save results to disk."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Use same timestamp as log file for consistency
+        timestamp = self.experiment_timestamp
 
         # Save main results (excluding non-serializable tensors)
         results_file = self.output_dir / f"experiment_results_{timestamp}.json"
@@ -338,6 +393,7 @@ class NameRecallExperiment:
             'correction_surprise': self.results['correction_surprise'],
             'num_conversations': self.results['num_conversations'],
             'total_turns_processed': self.results['total_turns_processed'],
+            'log_file': str(self.log_file),
             'memory_snapshots': [
                 {
                     'label': s['label'],
@@ -353,6 +409,7 @@ class NameRecallExperiment:
             json.dump(serializable_results, f, indent=2)
 
         logger.info(f"\nResults saved to: {results_file}")
+        logger.info(f"Full logs saved to: {self.log_file}")
 
     def save_memory(self, path: Optional[str] = None) -> Path:
         """
@@ -365,18 +422,23 @@ class NameRecallExperiment:
             Path to saved checkpoint file.
         """
         if path is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = self.output_dir / f"memory_checkpoint_{timestamp}.pt"
+            # Use experiment timestamp for consistency with other output files
+            path = self.output_dir / f"memory_checkpoint_{self.experiment_timestamp}.pt"
         else:
             path = Path(path)
 
         checkpoint = {
             'memory_layer': self.memory_layer.state_dict(),
             'embedder': self.embedder.state_dict(),
-            'memory_config': {
+            # Critical configs that must match when loading
+            'architecture': {
+                'memory_layer_positions': self.config.memory_layer_positions,
                 'hidden_dim': self.memory_config.hidden_dim,
                 'buffer_slots': self.memory_config.buffer_slots,
                 'store_slots': self.memory_config.store_slots,
+            },
+            # Non-critical configs (for reference only)
+            'memory_config': {
                 'z_score_threshold': self.memory_config.z_score_threshold,
                 'ema_alpha': self.memory_config.ema_alpha,
                 'capacity_pressure': self.memory_config.capacity_pressure,
@@ -401,12 +463,39 @@ class NameRecallExperiment:
 
         Returns:
             Checkpoint metadata dict.
+
+        Raises:
+            FileNotFoundError: If checkpoint file doesn't exist.
+            ValueError: If checkpoint architecture doesn't match current config.
         """
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
 
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+
+        # Validate architecture compatibility
+        if 'architecture' in checkpoint:
+            saved_arch = checkpoint['architecture']
+            current_arch = {
+                'memory_layer_positions': self.config.memory_layer_positions,
+                'hidden_dim': self.memory_config.hidden_dim,
+                'buffer_slots': self.memory_config.buffer_slots,
+                'store_slots': self.memory_config.store_slots,
+            }
+
+            mismatches = []
+            for key in current_arch:
+                if key in saved_arch and saved_arch[key] != current_arch[key]:
+                    mismatches.append(f"  {key}: checkpoint={saved_arch[key]}, current={current_arch[key]}")
+
+            if mismatches:
+                raise ValueError(
+                    f"Checkpoint architecture mismatch:\n" + "\n".join(mismatches) +
+                    f"\n\nUse matching CLI args or a compatible checkpoint."
+                )
+        else:
+            logger.warning("Checkpoint missing 'architecture' key - skipping validation (legacy checkpoint)")
 
         self.memory_layer.load_state_dict(checkpoint['memory_layer'])
         self.embedder.load_state_dict(checkpoint['embedder'])
@@ -496,7 +585,7 @@ def run_interactive_experiment():
 
     # Get configuration from user
     initial_name = input("\nEnter initial name (default: Alice): ").strip() or "Alice"
-    corrected_name = input("Enter corrected name (default: Bob): ").strip() or "Bob"
+    corrected_name = input("Enter corrected name (default: Sarah): ").strip() or "Sarah"
 
     try:
         num_turns = int(input("Number of reinforcement turns (default: 5): ").strip() or "5")
@@ -580,7 +669,7 @@ if __name__ == "__main__":
                         help="Run in interactive mode")
     parser.add_argument("--initial-name", type=str, default="Alice",
                         help="Initial name to use")
-    parser.add_argument("--corrected-name", type=str, default="Bob",
+    parser.add_argument("--corrected-name", type=str, default="Sarah",
                         help="Corrected name to use")
     parser.add_argument("--reinforcement-turns", type=int, default=5,
                         help="Number of reinforcement turns")
@@ -597,7 +686,20 @@ if __name__ == "__main__":
     parser.add_argument("--auto-save", action="store_true",
                         help="Automatically save memory checkpoint after experiment")
 
+    # Memory architecture settings (must match checkpoint if loading)
+    parser.add_argument("--memory-layers", type=str, default="3,6,9",
+                        help="Comma-separated layer positions for memory (e.g., '3,6,9')")
+    parser.add_argument("--hidden-dim", type=int, default=768,
+                        help="Hidden dimension size for memory embeddings")
+    parser.add_argument("--buffer-slots", type=int, default=256,
+                        help="Number of episodic buffer slots")
+    parser.add_argument("--store-slots", type=int, default=128,
+                        help="Number of surprise store slots")
+
     args = parser.parse_args()
+
+    # Parse memory layer positions
+    memory_layers = [int(x.strip()) for x in args.memory_layers.split(",")]
 
     if args.interactive:
         experiment, results = run_interactive_experiment()
@@ -608,7 +710,12 @@ if __name__ == "__main__":
             num_reinforcement_turns=args.reinforcement_turns,
             num_decay_cycles_between_convos=args.decay_cycles,
             output_dir=args.output_dir,
-            verbose=not args.quiet
+            verbose=not args.quiet,
+            # Memory architecture settings
+            memory_layer_positions=memory_layers,
+            hidden_dim=args.hidden_dim,
+            buffer_slots=args.buffer_slots,
+            store_slots=args.store_slots,
         )
 
         experiment = NameRecallExperiment(config)
