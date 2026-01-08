@@ -1,6 +1,6 @@
 # SEAM: Surprise-gated Episodic Adaptive Memory
 
-A biologically-inspired dual memory system for augmenting Large Language Models with persistent memory that survives across conversation turns.
+An internal-model dual memory system for augmenting LLMs with persistent memory that survives across conversations.
 
 ## Features
 
@@ -202,7 +202,7 @@ response, info = model.generate(
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.11+
 - PyTorch 2.0+
 - Transformers
 - tqdm
