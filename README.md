@@ -1,6 +1,6 @@
 # SEAM: Surprise-gated Episodic Adaptive Memory
 
-An internal-model dual memory system for augmenting LLMs with persistent memory that survives across conversations.
+An internal dual memory system for augmenting LLMs with persistent memory that survives across conversations.
 
 ## Features
 
